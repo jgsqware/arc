@@ -1,4 +1,4 @@
-module github.com/pomdtr/arc
+module github.com/jgsqware/arc
 
 go 1.21.4
 
