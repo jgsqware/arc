@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	_ "embed"
 
@@ -35,7 +36,7 @@ func NewCmdWindow() *cobra.Command {
 func NewCmdWindowCreate() *cobra.Command {
 	var flags struct {
 		Incognito bool
-		Little    bool
+		Focus     string
 	}
 
 	cmd := &cobra.Command{
@@ -44,6 +45,10 @@ func NewCmdWindowCreate() *cobra.Command {
 		Aliases: []string{"new"},
 		Args:    cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if flags.Focus != "" {
+				return windowCreateWithFocus(flags.Incognito, flags.Focus)
+			}
+
 			var applescript string
 			if flags.Incognito {
 				applescript = `tell application "Arc"
@@ -79,8 +84,78 @@ func NewCmdWindowCreate() *cobra.Command {
 	}
 
 	cmd.Flags().BoolVar(&flags.Incognito, "incognito", false, "open in incognito mode")
+	cmd.Flags().StringVar(&flags.Focus, "focus", "", "focus the tab whose title contains this string")
 
 	return cmd
+}
+
+func windowCreateWithFocus(incognito bool, search string) error {
+	// Check if Arc is already running before we launch it
+	wasRunning := true
+	out, err := runApplescript(`application "Arc" is running`)
+	if err == nil && strings.TrimSpace(string(out)) == "false" {
+		wasRunning = false
+	}
+
+	makeWindow := `make new window`
+	if incognito {
+		makeWindow = `make new window with properties {incognito:true}`
+	}
+
+	// Escape the search string for AppleScript
+	escaped := strings.ReplaceAll(search, `\`, `\\`)
+	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+
+	applescript := fmt.Sprintf(`tell application "Arc"
+	%s
+	delay 1
+	set maxRetries to 10
+	repeat with attempt from 1 to maxRetries
+		tell front window
+			set tabIndex to 1
+			repeat with aTab in every tab
+				try
+					set tabTitle to title of aTab
+					ignoring case
+						if tabTitle contains "%s" then
+							tell tab tabIndex to select
+							activate
+							return "found"
+						end if
+					end ignoring
+				end try
+				set tabIndex to tabIndex + 1
+			end repeat
+		end tell
+		if attempt < maxRetries then delay 0.5
+	end repeat
+	activate
+	return "not_found"
+end tell`, makeWindow, escaped)
+
+	output, err := runApplescript(applescript)
+	if err != nil {
+		return err
+	}
+
+	// If Arc was not running, it opens startup windows alongside ours.
+	// Close all windows except the front one (which is the one we just created).
+	if !wasRunning {
+		if _, err := runApplescript(`tell application "Arc"
+	set windowCount to count of windows
+	repeat with i from windowCount to 2 by -1
+		close window i
+	end repeat
+end tell`); err != nil {
+			return err
+		}
+	}
+
+	if strings.TrimSpace(string(output)) == "not_found" {
+		return fmt.Errorf("no tab found with title containing %q", search)
+	}
+
+	return nil
 }
 
 //go:embed applescript/list-windows.applescript
