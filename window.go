@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 
@@ -27,6 +28,7 @@ func NewCmdWindow() *cobra.Command {
 	}
 
 	cmd.AddCommand(NewCmdWindowCreate())
+	cmd.AddCommand(NewCmdWindowFocus())
 	cmd.AddCommand(NewCmdWindowClose())
 	cmd.AddCommand(NewCmdWindowList())
 
@@ -46,7 +48,7 @@ func NewCmdWindowCreate() *cobra.Command {
 		Args:    cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if flags.Focus != "" {
-				return windowCreateWithFocus(flags.Incognito, flags.Focus)
+				return windowCreateWithFocus(flags.Focus)
 			}
 
 			var applescript string
@@ -89,73 +91,187 @@ func NewCmdWindowCreate() *cobra.Command {
 	return cmd
 }
 
-func windowCreateWithFocus(incognito bool, search string) error {
-	// Check if Arc is already running before we launch it
-	wasRunning := true
-	out, err := runApplescript(`application "Arc" is running`)
-	if err == nil && strings.TrimSpace(string(out)) == "false" {
-		wasRunning = false
-	}
+func windowCreateWithFocus(search string) error {
+	searchLower := strings.ToLower(search)
 
-	makeWindow := `make new window`
-	if incognito {
-		makeWindow = `make new window with properties {incognito:true}`
-	}
-
-	// Escape the search string for AppleScript
-	escaped := strings.ReplaceAll(search, `\`, `\\`)
-	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
-
-	applescript := fmt.Sprintf(`tell application "Arc"
-	%s
-	delay 1
-	set maxRetries to 10
-	repeat with attempt from 1 to maxRetries
-		tell front window
-			set tabIndex to 1
-			repeat with aTab in every tab
-				try
-					set tabTitle to title of aTab
-					ignoring case
-						if tabTitle contains "%s" then
-							tell tab tabIndex to select
-							activate
-							return "found"
-						end if
-					end ignoring
-				end try
-				set tabIndex to tabIndex + 1
-			end repeat
-		end tell
-		if attempt < maxRetries then delay 0.5
-	end repeat
+	// Try to find the tab in the existing front window first (idempotent path).
+	if output, err := runApplescript(listTabsScript); err == nil {
+		var tabs []Tab
+		if json.Unmarshal(output, &tabs) == nil {
+			if idx := findTab(tabs, searchLower); idx != -1 {
+				_, _ = runApplescript(fmt.Sprintf(`tell application "Arc"
+	tell front window
+		tell tab %d to select
+	end tell
 	activate
-	return "not_found"
-end tell`, makeWindow, escaped)
+end tell`, idx+1))
+				return nil
+			}
+		}
+	}
 
-	output, err := runApplescript(applescript)
+	// No existing window or no match — create a new window and wait for it to populate.
+	if _, err := runApplescript(`tell application "Arc"
+	make new window
+	activate
+	delay 3
+end tell`); err != nil {
+		return err
+	}
+
+	output, err := runApplescript(listTabsScript)
 	if err != nil {
 		return err
 	}
 
-	// If Arc was not running, it opens startup windows alongside ours.
-	// Close all windows except the front one (which is the one we just created).
-	if !wasRunning {
-		if _, err := runApplescript(`tell application "Arc"
-	set windowCount to count of windows
-	repeat with i from windowCount to 2 by -1
-		close window i
-	end repeat
-end tell`); err != nil {
+	var tabs []Tab
+	if err := json.Unmarshal(output, &tabs); err != nil {
+		return err
+	}
+
+	if idx := findTab(tabs, searchLower); idx != -1 {
+		if _, err := runApplescript(fmt.Sprintf(`tell application "Arc"
+	tell front window
+		tell tab %d to select
+	end tell
+	activate
+end tell`, idx+1)); err != nil {
+			_, _ = runApplescript(`tell application "Arc" to close front window`)
 			return err
 		}
+		return nil
 	}
 
-	if strings.TrimSpace(string(output)) == "not_found" {
-		return fmt.Errorf("no tab found with title containing %q", search)
+	_, _ = runApplescript(`tell application "Arc" to close front window`)
+	return fmt.Errorf("no tab found with title or URL containing %q", search)
+}
+
+func NewCmdWindowFocus() *cobra.Command {
+	var flags struct {
+		Create bool
 	}
 
-	return nil
+	cmd := &cobra.Command{
+		Use:   "focus <search>",
+		Short: "Focus a tab by title or URL in the current space",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			search := strings.ToLower(args[0])
+			hasArcWindow, err := hasArcWindowOnCurrentSpace()
+			if err != nil {
+				return fmt.Errorf("failed to query yabai: %w", err)
+			}
+
+			if hasArcWindow {
+				// Arc window exists on this space — activate it and find the tab.
+				if _, err := runApplescript(`tell application "Arc" to activate`); err != nil {
+					return err
+				}
+
+				output, err := runApplescript(listTabsScript)
+				if err != nil {
+					return err
+				}
+
+				var tabs []Tab
+				if err := json.Unmarshal(output, &tabs); err != nil {
+					return err
+				}
+
+				if idx := findTab(tabs, search); idx != -1 {
+					_, err := runApplescript(fmt.Sprintf(`tell application "Arc"
+	tell front window
+		tell tab %d to select
+	end tell
+	activate
+end tell`, idx+1))
+					return err
+				}
+
+				return fmt.Errorf("no tab found with title or URL containing %q", args[0])
+			}
+
+			if !flags.Create {
+				return fmt.Errorf("no Arc window on current space (use --create to create one)")
+			}
+
+			// No Arc window on this space — create one.
+			if _, err := runApplescript(`tell application "Arc"
+	make new window
+	activate
+	delay 3
+end tell`); err != nil {
+				return err
+			}
+
+			output, err := runApplescript(listTabsScript)
+			if err != nil {
+				return err
+			}
+
+			var tabs []Tab
+			if err := json.Unmarshal(output, &tabs); err != nil {
+				return err
+			}
+
+			if idx := findTab(tabs, search); idx != -1 {
+				if _, err := runApplescript(fmt.Sprintf(`tell application "Arc"
+	tell front window
+		tell tab %d to select
+	end tell
+	activate
+end tell`, idx+1)); err != nil {
+					_, _ = runApplescript(`tell application "Arc" to close front window`)
+					return err
+				}
+				return nil
+			}
+
+			_, _ = runApplescript(`tell application "Arc" to close front window`)
+			return fmt.Errorf("no tab found with title or URL containing %q", args[0])
+		},
+	}
+
+	cmd.Flags().BoolVar(&flags.Create, "create", false, "create a new window if none exists on the current space")
+	return cmd
+}
+
+// hasArcWindowOnCurrentSpace queries yabai to check if an Arc window exists on the focused space.
+func hasArcWindowOnCurrentSpace() (bool, error) {
+	output, err := exec.Command("yabai", "-m", "query", "--windows", "--space").Output()
+	if err != nil {
+		return false, err
+	}
+
+	var windows []struct {
+		App string `json:"app"`
+	}
+	if err := json.Unmarshal(output, &windows); err != nil {
+		return false, err
+	}
+
+	for _, w := range windows {
+		if w.App == "Arc" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// findTab returns the index of the first tab whose title or URL contains the search string.
+// Returns -1 if no match is found.
+func findTab(tabs []Tab, searchLower string) int {
+	for i, tab := range tabs {
+		if strings.Contains(strings.ToLower(tab.Title), searchLower) {
+			return i
+		}
+	}
+	for i, tab := range tabs {
+		if strings.Contains(strings.ToLower(tab.URL), searchLower) {
+			return i
+		}
+	}
+	return -1
 }
 
 //go:embed applescript/list-windows.applescript
