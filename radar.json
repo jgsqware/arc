@@ -1,0 +1,15 @@
+{
+  "id": "arc",
+  "name": "Arc CLI",
+  "family": "devtools",
+  "kind": "cli",
+  "stack": "Go (Cobra + sqlite)",
+  "summary": "CLI compagnon du navigateur Arc via AppleScript, historique en sqlite",
+  "visibility": "local",
+  "exposes": null,
+  "subtools": [],
+  "depends_on": [
+    "arc-browser"
+  ],
+  "links": []
+}
